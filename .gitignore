@@ -12,6 +12,9 @@ env/
 # Environment / secrets
 .env
 
+# Runtime-generated citizen feedback (written by the app at runtime)
+feedback.csv
+
 # OS
 .DS_Store
 Thumbs.db
