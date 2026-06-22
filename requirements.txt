@@ -1,3 +1,9 @@
 streamlit>=1.35
 pandas>=2.0
 requests>=2.31
+
+# Optional LLM providers for the Citizen Copilot tab.
+# The app runs without these (Disabled mode); install the one(s) you use.
+openai>=1.0
+anthropic>=0.40
+google-genai>=0.3

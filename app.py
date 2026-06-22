@@ -5,10 +5,21 @@ from datetime import datetime, timedelta, time as dtime
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import quote
 
+import csv
+from pathlib import Path
+
 import pandas as pd
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+
+from geocode import landmark_names
+from insights import render_insights_tab
+from intents import INTENTS, run_intent
+from providers import DEFAULT_MODELS, get_provider
+
+FEEDBACK_PATH = Path(__file__).with_name("feedback.csv")
+PROVIDER_NAMES = ["Disabled", "OpenAI", "Anthropic", "Gemini"]
 
 DEFAULT_BASE_URL = "https://portail-api-data.montpellier3m.fr"
 API_PORTAL_URL = "https://portail-api.montpellier3m.fr/"
@@ -528,6 +539,116 @@ def render_docs() -> None:
     )
 
 
+def _render_data_used(result: Mapping[str, Any]) -> None:
+    with st.expander("Data used (live, from the Montpellier API)", expanded=False):
+        st.caption(
+            f"Intent: `{result.get('intent')}` | "
+            f"confidence: {result.get('confidence')} | "
+            f"rows used: {len(result.get('items') or [])}"
+        )
+        freshness = result.get("freshness") or {}
+        if freshness.get("oldest_timestamp"):
+            stale = freshness.get("stale")
+            flag = "⚠️ stale" if stale else "fresh"
+            st.caption(
+                f"Reading age: oldest {freshness.get('oldest_timestamp')} "
+                f"(~{int(freshness.get('age_seconds') or 0)} s old, {flag})"
+            )
+        items = result.get("items") or []
+        if items:
+            st.dataframe(pd.DataFrame(items), use_container_width=True, hide_index=True)
+        notes = result.get("notes") or []
+        for note in notes:
+            st.caption(f"• {note}")
+
+
+def render_copilot(datasets: Mapping[str, pd.DataFrame], provider, allow_nominatim: bool) -> None:
+    st.subheader("Ask Montpellier — Citizen Copilot")
+    st.caption(
+        "Ask in plain language (e.g. \"Where can I find a bike near the Comédie?\" or "
+        "\"I want to bike from the university to Antigone\"). The Montpellier API is the source "
+        "of truth; the assistant only routes your question and explains the live result."
+    )
+
+    question = st.text_input(
+        "Your question",
+        placeholder="Where can I find a bike near Gare Saint-Roch?",
+        key="copilot_question",
+    )
+
+    with st.expander("Pin a location instead of typing one (optional)"):
+        use_pin = st.checkbox("Use these coordinates as the location", key="copilot_use_pin")
+        pin_lat = st.number_input("Latitude", value=43.6109, format="%.5f", key="copilot_lat")
+        pin_lon = st.number_input("Longitude", value=3.8772, format="%.5f", key="copilot_lon")
+
+    if not st.button("Ask", type="primary"):
+        return
+    if not question.strip():
+        st.info("Type a question first.")
+        return
+
+    try:
+        classification = provider.classify_intent(question, INTENTS, landmark_names())
+    except RuntimeError as exc:
+        st.error(str(exc))
+        return
+    except Exception as exc:  # surfaced for debugging in the UI
+        st.error(f"Could not classify the question: {exc}")
+        return
+
+    intent = classification.get("intent", "unsupported")
+    params = dict(classification.get("params") or {})
+    if use_pin:
+        params["latitude"] = pin_lat
+        params["longitude"] = pin_lon
+
+    result = run_intent(intent, params, datasets, allow_nominatim=allow_nominatim)
+
+    try:
+        answer = provider.explain(intent, params, result)
+    except Exception as exc:
+        # Never block on the explainer: the deterministic summary is always valid.
+        answer = result.get("summary", "")
+        st.caption(f"(Explanation step unavailable: {exc} — showing the verified summary.)")
+
+    if result.get("ok"):
+        st.success(answer or result.get("summary", ""))
+        map_points = [
+            {"latitude": it["latitude"], "longitude": it["longitude"]}
+            for it in (result.get("items") or [])
+            if isinstance(it.get("latitude"), (int, float)) and isinstance(it.get("longitude"), (int, float))
+        ]
+        if map_points:
+            st.map(pd.DataFrame(map_points), zoom=13)
+    else:
+        st.warning(answer or result.get("summary", ""))
+
+    _render_data_used(result)
+
+
+def render_feedback() -> None:
+    with st.expander("Report a data issue (citizen feedback)"):
+        with st.form("feedback_form", clear_on_submit=True):
+            resource = st.selectbox("Which data?", ["bikestation", "offstreetparking",
+                                                     "parkingspaces", "ecocounter",
+                                                     "wastecontainer", "other"])
+            message = st.text_area("What looks wrong or out of date?")
+            contact = st.text_input("Contact (optional)")
+            submitted = st.form_submit_button("Submit feedback")
+        if submitted:
+            if not message.strip():
+                st.info("Please describe the issue before submitting.")
+                return
+            is_new = not FEEDBACK_PATH.exists()
+            with FEEDBACK_PATH.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                if is_new:
+                    writer.writerow(["timestamp", "resource", "message", "contact"])
+                writer.writerow([datetime.now().isoformat(timespec="seconds"),
+                                 resource, message.strip(), contact.strip()])
+            st.success("Thanks — your feedback was saved locally.")
+
+
 def main() -> None:
     st.set_page_config(page_title="Montpellier live open data", layout="wide")
     st.title("Montpellier live open-data dashboard")
@@ -545,8 +666,27 @@ def main() -> None:
         auto_refresh = st.checkbox("Auto-refresh page")
         refresh_seconds = st.slider("Refresh interval, seconds", 15, 600, 60, step=15, disabled=not auto_refresh)
         st.divider()
+
+        st.header("Assistant")
+        provider_name = st.selectbox("LLM provider", PROVIDER_NAMES, index=0)
+        api_key = ""
+        model = None
+        if provider_name != "Disabled":
+            api_key = st.text_input(f"{provider_name} API key", type="password")
+            model = st.text_input(
+                "Model (optional override)",
+                value=DEFAULT_MODELS.get(provider_name, ""),
+            ).strip() or None
+        else:
+            st.caption("Disabled mode answers using keyword routing only — no API key, no cost.")
+        allow_nominatim = st.checkbox(
+            "Allow external geocoding (Nominatim) for unknown places", value=False
+        )
+        st.divider()
         st.markdown(f"[API portal]({API_PORTAL_URL})")
         st.markdown(f"[OpenAPI YAML]({OPENAPI_URL})")
+
+    provider = get_provider(provider_name, api_key or None, model)
 
     fetched: Dict[str, pd.DataFrame] = {}
     raw_payloads: Dict[str, Any] = {}
@@ -562,9 +702,16 @@ def main() -> None:
                 fetched[key] = df if df is not None else pd.DataFrame()
                 raw_payloads[key] = payload
 
-    tab_dashboard, tab_explorer, tab_timeseries, tab_raw, tab_docs = st.tabs(
-        ["Dashboard", "Data explorer", "Time series", "Raw JSON", "API docs"]
+    (tab_copilot, tab_insights, tab_dashboard, tab_explorer,
+     tab_timeseries, tab_raw, tab_docs) = st.tabs(
+        ["Ask Montpellier", "Public & Ecological Insights", "Dashboard",
+         "Data explorer", "Time series", "Raw JSON", "API docs"]
     )
+    with tab_copilot:
+        render_copilot(fetched, provider, allow_nominatim)
+        render_feedback()
+    with tab_insights:
+        render_insights_tab(fetched)
     with tab_dashboard:
         render_dashboard(fetched, errors)
     with tab_explorer:
